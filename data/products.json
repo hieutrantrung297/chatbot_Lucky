@@ -1,0 +1,26 @@
+{
+  "products": [
+    {
+      "id": "banh_kem",
+      "name": "Bánh Kem",
+      "prices": {
+        "16cm": 180000,
+        "20cm": 280000
+      },
+      "min_order_days": 1
+    },
+    {
+      "id": "banh_su_kem",
+      "name": "Bánh Su Kem",
+      "prices": {
+        "1 hộp": 25000
+      },
+      "min_order_days": 0
+    }
+  ],
+  "delivery": {
+    "free_km": 5,
+    "fee_per_km": 10000
+  },
+  "default_min_days": 1
+}

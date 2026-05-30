@@ -6,8 +6,6 @@ from pathlib import Path
 import chromadb
 from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
 
-from app.catalog import get_catalog_text
-
 logger = logging.getLogger(__name__)
 
 _KNOWLEDGE_DIR = Path(__file__).parent.parent / "data" / "knowledge"
@@ -49,25 +47,19 @@ def _chunk_text(text: str, source: str) -> list[dict]:
 
 
 def build_index() -> None:
-    """Build (or rebuild) the ChromaDB index from knowledge files + catalog."""
+    """Build (or rebuild) the ChromaDB index from knowledge markdown files."""
     col = _get_collection()
 
     chunks: list[dict] = []
 
-    # Markdown knowledge files
     for md_file in sorted(_KNOWLEDGE_DIR.glob("*.md")):
         text = md_file.read_text(encoding="utf-8")
         chunks.extend(_chunk_text(text, md_file.stem))
-
-    # Catalog as a single chunk
-    catalog_text = get_catalog_text()
-    chunks.append({"id": "catalog_full", "text": catalog_text, "source": "catalog"})
 
     if not chunks:
         logger.warning("Không có document nào để index")
         return
 
-    # Clear old data and re-index
     existing = col.get()
     if existing["ids"]:
         col.delete(ids=existing["ids"])

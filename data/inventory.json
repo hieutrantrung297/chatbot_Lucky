@@ -1,0 +1,14 @@
+{
+  "banh_kem": {
+    "16cm": {
+      "available": true
+    },
+    "20cm": {
+      "available": true
+    }
+  },
+  "banh_su_kem": {
+    "quantity": 10
+  },
+  "updated_at": "30/05/2026 14:03"
+}

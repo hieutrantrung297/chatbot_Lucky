@@ -45,6 +45,7 @@ class OrderInProgress(BaseModel):
     delivery_date: Optional[str] = None  # DD/MM/YYYY
     address: Optional[str] = None
     special_requests: Optional[str] = None
+    same_day_order: bool = False  # True khi khách đặt + giao trong cùng ngày
 
     # Cờ nội bộ: đã xác định có phải bánh kem chưa (None = chưa xác định)
     _is_cream_cake: Optional[bool] = None

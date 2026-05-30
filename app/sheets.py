@@ -79,6 +79,32 @@ def get_orders_by_phone(phone: str) -> list[dict]:
         return []
 
 
+def get_recent_orders(n: int = 20) -> list[dict]:
+    """Lấy N đơn hàng gần nhất (mới nhất trước). Dùng cho admin dashboard."""
+    try:
+        worksheet = _get_worksheet()
+        records = worksheet.get_all_records()
+        recent = list(reversed(records[-n:])) if records else []
+        return [
+            {
+                "order_id":      r.get("Mã Đơn", ""),
+                "created_at":    r.get("Thời Gian", ""),
+                "name":          r.get("Tên KH", ""),
+                "phone":         r.get("SĐT", ""),
+                "cake_type":     r.get("Loại Bánh", ""),
+                "size":          r.get("Size", ""),
+                "delivery_date": r.get("Ngày Giao", ""),
+                "total_price":   r.get("Tổng Tiền", ""),
+                "notes":         r.get("Ghi Chú", ""),
+                "status":        r.get("Trạng Thái", ""),
+            }
+            for r in recent
+        ]
+    except Exception as exc:
+        logger.error("Lỗi lấy đơn hàng gần đây: %s", exc)
+        return []
+
+
 def append_order(order: Order) -> bool:
     """Ghi 1 đơn hàng mới vào Google Sheets. Trả về True nếu thành công."""
     print(f"[SHEETS] Đang ghi đơn {order.order_id} vào Google Sheets...")

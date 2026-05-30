@@ -5,6 +5,7 @@ import logging
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import PlainTextResponse
 
+from app.admin import router as admin_router
 from app.conversation import handle_message
 from app.messenger import parse_incoming, send_message, verify_signature, verify_webhook
 
@@ -15,6 +16,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Lucky Cake Chatbot", version="1.0.0")
+app.include_router(admin_router)
 
 
 @app.on_event("startup")

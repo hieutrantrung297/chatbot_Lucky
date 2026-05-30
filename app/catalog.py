@@ -1,4 +1,4 @@
-"""Quản lý danh mục sản phẩm từ data/catalog.json."""
+"""Quản lý danh mục sản phẩm từ data/products.json."""
 
 import json
 import logging
@@ -7,54 +7,57 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-_CATALOG_PATH = Path(__file__).parent.parent / "data" / "catalog.json"
+_PRODUCTS_PATH = Path(__file__).parent.parent / "data" / "products.json"
 
 
 @lru_cache
-def load_catalog() -> dict:
-    """Load catalog từ file JSON (cache sau lần đầu)."""
-    return json.loads(_CATALOG_PATH.read_text(encoding="utf-8"))
+def _load_products() -> dict:
+    return json.loads(_PRODUCTS_PATH.read_text(encoding="utf-8"))
 
 
 def get_catalog_text() -> str:
-    """Trả về mô tả catalog dạng text để inject vào system prompt."""
-    catalog = load_catalog()
+    """Trả về mô tả catalog dạng text để inject vào order_agent system prompt."""
+    data = _load_products()
     lines = []
-    for product in catalog["products"]:
+    for product in data["products"]:
         lines.append(f"\n### {product['name']}")
-        lines.append(f"Mô tả: {product['description']}")
-        lines.append(f"Hương vị: {', '.join(product['flavors'])}")
         lines.append("Bảng giá:")
-        for size, info in product["sizes"].items():
-            lines.append(f"  - {size}: {info['price']:,}đ ({info['serves']})")
-        if product.get("note"):
-            lines.append(f"Lưu ý: {product['note']}")
+        for size, price in product["prices"].items():
+            lines.append(f"  - {size}: {price:,}đ")
     return "\n".join(lines)
 
 
 def get_price(cake_type: str, size: str) -> float:
     """Tìm giá bánh theo tên và size. Trả về 0 nếu không tìm thấy."""
-    catalog = load_catalog()
-    cake_type_lower = cake_type.lower()
+    data = _load_products()
+    cake_lower = cake_type.lower()
     size_lower = size.lower()
-    for product in catalog["products"]:
-        if product["name"].lower() in cake_type_lower or cake_type_lower in product["name"].lower():
-            if size_lower in product["sizes"]:
-                return float(product["sizes"][size_lower]["price"])
+    for product in data["products"]:
+        name_lower = product["name"].lower()
+        if name_lower in cake_lower or cake_lower in name_lower:
+            if size_lower in product["prices"]:
+                return float(product["prices"][size_lower])
     return 0.0
 
 
 def calculate_delivery_fee(distance_km: float = 0.0) -> float:
     """Tính phí giao hàng theo khoảng cách (mặc định miễn phí nếu không biết)."""
-    catalog = load_catalog()
-    policies = catalog.get("policies", {})
-    free_km = policies.get("free_delivery_km", 5)
-    fee_per_km = policies.get("delivery_fee_per_km", 15000)
+    data = _load_products()
+    delivery = data.get("delivery", {})
+    free_km = delivery.get("free_km", 5)
+    fee_per_km = delivery.get("fee_per_km", 10000)
     if distance_km <= free_km:
         return 0.0
     return (distance_km - free_km) * fee_per_km
 
 
-def get_min_order_days() -> int:
-    catalog = load_catalog()
-    return catalog.get("policies", {}).get("min_order_days", 2)
+def get_min_order_days(cake_type: str = "") -> int:
+    """Số ngày đặt trước tối thiểu. Truyền cake_type để lấy chính xác theo loại bánh."""
+    data = _load_products()
+    if cake_type:
+        cake_lower = cake_type.lower()
+        for product in data["products"]:
+            name_lower = product["name"].lower()
+            if name_lower in cake_lower or cake_lower in name_lower:
+                return product.get("min_order_days", data.get("default_min_days", 1))
+    return data.get("default_min_days", 1)

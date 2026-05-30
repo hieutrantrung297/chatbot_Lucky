@@ -59,27 +59,42 @@ def _validate_phone(phone: str) -> bool:
     return bool(re.match(r"^(0|\+84)(3|5|7|8|9)\d{8}$", cleaned))
 
 
-def _validate_date(date_str: str) -> tuple[bool, str]:
+def _is_su_kem(cake_type: str) -> bool:
+    return "su kem" in cake_type.lower() or "sukem" in cake_type.lower()
+
+
+def _validate_date(date_str: str, cake_type: str = "") -> tuple[bool, str, bool]:
     """
     Kiểm tra ngày giao hàng hợp lệ.
-    Trả về (is_valid, error_message).
+    Trả về (is_valid, error_message, is_same_day).
+    is_same_day=True khi khách chọn giao hôm nay — cần chủ tiệm xác nhận thủ công.
     """
     try:
         delivery_date = datetime.strptime(date_str.strip(), "%d/%m/%Y").date()
     except ValueError:
-        return False, "Ngày không đúng định dạng. Anh/chị nhập lại theo định dạng DD/MM/YYYY nhé ạ (VD: 20/04/2026)"
+        return False, "Ngày không đúng định dạng. Anh/chị nhập lại theo định dạng DD/MM/YYYY nhé ạ (VD: 20/04/2026)", False
 
     today = datetime.now().date()
-    min_days = get_min_order_days()
-    earliest = today + timedelta(days=min_days)
 
+    if delivery_date < today:
+        return False, "Ngày giao không thể là ngày trong quá khứ ạ. Anh/chị chọn lại ngày nhé! 📅", False
+
+    if delivery_date == today:
+        # Su kem không cần đặt trước → bình thường
+        if _is_su_kem(cake_type):
+            return True, "", False
+        # Các loại bánh khác giao cùng ngày → cho phép nhưng cần chủ tiệm xác nhận
+        return True, "", True
+
+    min_days = get_min_order_days(cake_type)
+    earliest = today + timedelta(days=min_days)
     if delivery_date < earliest:
         return False, (
             f"Dạ tiệm cần đặt trước tối thiểu {min_days} ngày ạ. "
             f"Ngày giao sớm nhất là {earliest.strftime('%d/%m/%Y')}. "
             "Anh/chị chọn lại ngày nhé! 🙏"
-        )
-    return True, ""
+        ), False
+    return True, "", False
 
 
 def _generate_order_id() -> str:
@@ -110,6 +125,24 @@ def format_order_summary(order: OrderInProgress, is_cream_cake: bool, unit_price
         f"💳 Tiền cọc (50%): {_fmt_vnd(deposit)}\n\n"
         f"Thông tin trên có đúng không ạ? ✅\n"
         f"(Nhắn *'xác nhận'* để chốt đơn, hoặc *'sửa tên/sđt/bánh/size/hương vị/chữ/ngày/địa chỉ'* để chỉnh)"
+    )
+
+
+def _format_same_day_confirmation(order: Order) -> str:
+    """Xác nhận đơn đặt cùng ngày — nhắc khách chờ tiệm liên hệ lại."""
+    cake_msg_line = f"📝 Chữ trên bánh: {order.cake_message}\n" if order.cake_message else ""
+    return (
+        f"✅ Em đã ghi nhận đơn của anh/chị!\n\n"
+        f"🧾 Mã đơn: {order.order_id}\n"
+        f"👤 Tên: {order.name}\n"
+        f"📱 SĐT: {order.phone}\n"
+        f"🎂 Bánh: {order.cake_type} ({order.size})\n"
+        f"🍫 Hương vị: {order.flavor}\n"
+        f"{cake_msg_line}"
+        f"📅 Ngày giao: {order.delivery_date} (hôm nay)\n"
+        f"📍 Địa chỉ: {order.address}\n\n"
+        f"⚡ Đây là đơn giao trong ngày — tiệm sẽ liên hệ lại với anh/chị trong vài phút để xác nhận có làm kịp không nhé ạ.\n"
+        f"Anh/chị có thể gọi trực tiếp số 0977192509 để được xác nhận nhanh hơn! 📞"
     )
 
 
@@ -162,15 +195,28 @@ def process_ordering(record: ConversationRecord, user_text: str) -> tuple[Conver
 
     elif next_field == "cake_type":
         order.cake_type = user_text.strip()
-        # Xác định ngay sau khi biết loại bánh
         record.is_cream_cake = needs_cake_message(order.cake_type)
         is_cream = record.is_cream_cake
+        # Su kem: kiểm tra tồn kho ngay, auto-set size
+        if _is_su_kem(order.cake_type):
+            from app.inventory import is_su_kem_available
+            available, qty = is_su_kem_available()
+            if not available:
+                order.cake_type = None
+                record.order_in_progress = order
+                return record, (
+                    "Dạ xin lỗi anh/chị, bánh su kem hôm nay đã hết hàng rồi ạ 😔\n"
+                    "Anh/chị có muốn đặt loại bánh khác không ạ?"
+                )
+            order.size = "1 hộp"  # Auto-set, bỏ qua bước hỏi size
 
     elif next_field == "delivery_date":
-        valid, err_msg = _validate_date(user_text)
+        valid, err_msg, is_same_day = _validate_date(user_text, order.cake_type or "")
         if not valid:
             return record, err_msg
         order.delivery_date = user_text.strip()
+        if is_same_day:
+            order.same_day_order = True
 
     elif next_field == "cake_message":
         # Khách có thể chọn "không cần" / "bỏ trống"
@@ -270,6 +316,8 @@ def process_confirming(record: ConversationRecord, user_text: str) -> tuple[Conv
         delivery_fee = 0.0
         total = unit_price + delivery_fee
         deposit = total * 0.5
+        is_same_day = order.same_day_order
+        notes = "⚡ ĐẶTCÙNGNGÀY" if is_same_day else None
 
         completed_order = Order(
             order_id=_generate_order_id(),
@@ -289,10 +337,18 @@ def process_confirming(record: ConversationRecord, user_text: str) -> tuple[Conv
             deposit_required=deposit,
             status=OrderStatus.PENDING,
             created_at=datetime.now().strftime("%d/%m/%Y %H:%M"),
+            notes=notes,
         )
 
         from app.sheets import append_order
         append_order(completed_order)
+
+        # Trừ tồn kho su kem
+        if _is_su_kem(order.cake_type or ""):
+            from app.inventory import is_su_kem_available, set_su_kem_quantity
+            _, qty = is_su_kem_available()
+            if qty is not None and qty > 0:
+                set_su_kem_quantity(qty - 1)
 
         record.state = ConversationState.CONFIRMED
         record.current_order_id = completed_order.order_id
@@ -304,6 +360,8 @@ def process_confirming(record: ConversationRecord, user_text: str) -> tuple[Conv
             "content": "[ĐƠN HÀNG ĐÃ HOÀN TẤT. Các tin nhắn tiếp theo là hội thoại mới, không liên quan đến đơn trên.]"
         })
 
+        if is_same_day:
+            return record, _format_same_day_confirmation(completed_order)
         return record, _format_order_confirmation(completed_order)
 
     # ── Sửa field cụ thể ────────────────────────────────────────────────────

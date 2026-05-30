@@ -25,6 +25,9 @@ class Settings(BaseSettings):
     google_service_account_json: str   # Nội dung JSON trên 1 dòng
     google_sheet_id: str
 
+    # ── Admin dashboard ───────────────────────────────────────────────────────
+    admin_password: str = "lucky2024"
+
     # ── App ───────────────────────────────────────────────────────────────────
     server_url: str = ""
     data_dir: str = "data"

@@ -3,7 +3,7 @@
 import json
 import logging
 
-from openai import OpenAI
+from openai import OpenAI, RateLimitError
 
 from app.config import get_settings
 from app.knowledge_base import search as kb_search
@@ -35,6 +35,22 @@ _TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "check_inventory",
+            "description": (
+                "Kiểm tra tồn kho hiện tại: bánh kem có sẵn size nào, "
+                "bánh su kem còn bao nhiêu hộp. "
+                "Dùng khi khách hỏi 'còn bánh không', 'hết hàng chưa', 'còn size X không'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "check_order_status",
             "description": "Tra cứu trạng thái đơn hàng của khách theo số điện thoại.",
             "parameters": {
@@ -55,12 +71,16 @@ _SYSTEM_PROMPT = """\
 Bạn là Lucky — nhân viên tư vấn thân thiện của tiệm bánh Lucky tại Hoài Nhơn, Bình Định.
 Nhiệm vụ: tư vấn sản phẩm, giải đáp thắc mắc, chăm sóc khách hàng.
 
-Quy tắc:
-- Với mọi câu hỏi về sản phẩm, giá, chính sách, gợi ý — gọi search_knowledge TRƯỚC, rồi trả lời dựa trên kết quả.
+Quy tắc sử dụng tool:
+- Với MỌI câu hỏi về sản phẩm, giá, chính sách, gợi ý, hướng dẫn — gọi search_knowledge TRƯỚC, rồi trả lời dựa trên kết quả.
+- Khi khách hỏi "còn hàng không", "hết bánh chưa", "còn size X không" — gọi check_inventory.
 - Khi khách muốn kiểm tra đơn hàng và cung cấp số điện thoại — gọi check_order_status.
 - Khi khách muốn đặt bánh (nhắn "đặt bánh", "mua bánh", "order"...) — trả lời ngắn rồi kết thúc bằng token đặc biệt __START_ORDER__
+
+Quy tắc trả lời:
 - Trả lời tự nhiên, thân thiện, ngắn gọn bằng tiếng Việt. Dùng emoji vừa phải.
-- Không bịa thông tin — chỉ dùng nội dung từ search_knowledge.
+- Không bịa thông tin — chỉ dùng nội dung từ kết quả tool.
+- Nếu không tìm thấy thông tin trong knowledge, trả lời thật thà và hướng khách liên hệ 0977192509.
 """
 
 
@@ -91,9 +111,14 @@ def _status_label(status: str) -> str:
     }.get(status, status)
 
 
-def _get_client() -> OpenAI:
+def _get_gh_client() -> OpenAI:
     s = get_settings()
     return OpenAI(base_url=s.github_models_endpoint, api_key=s.github_token)
+
+
+def _get_oa_client() -> OpenAI | None:
+    s = get_settings()
+    return OpenAI(api_key=s.openai_api_key) if s.openai_api_key else None
 
 
 async def get_agent_response(
@@ -108,7 +133,33 @@ async def get_agent_response(
     import asyncio
 
     settings = get_settings()
-    client = _get_client()
+    gh_client = _get_gh_client()
+    oa_client = _get_oa_client()
+
+    async def _call(msgs):
+        try:
+            return await asyncio.to_thread(
+                gh_client.chat.completions.create,
+                model=settings.ai_model,
+                messages=msgs,
+                tools=_TOOLS,
+                tool_choice="auto",
+                max_tokens=600,
+                temperature=0.7,
+            )
+        except RateLimitError:
+            logger.warning("agent: GitHub Models rate limit — fallback OpenAI")
+            if oa_client:
+                return await asyncio.to_thread(
+                    oa_client.chat.completions.create,
+                    model=settings.openai_model,
+                    messages=msgs,
+                    tools=_TOOLS,
+                    tool_choice="auto",
+                    max_tokens=600,
+                    temperature=0.7,
+                )
+            raise
 
     messages = [{"role": "system", "content": _SYSTEM_PROMPT}]
     messages += message_history[-20:]
@@ -116,15 +167,7 @@ async def get_agent_response(
 
     # Agent loop — tối đa 5 lượt tool call
     for _ in range(5):
-        response = await asyncio.to_thread(
-            client.chat.completions.create,
-            model=settings.ai_model,
-            messages=messages,
-            tools=_TOOLS,
-            tool_choice="auto",
-            max_tokens=600,
-            temperature=0.7,
-        )
+        response = await _call(messages)
 
         msg = response.choices[0].message
 
@@ -163,6 +206,9 @@ async def get_agent_response(
 
             if fn_name == "search_knowledge":
                 result = kb_search(fn_args.get("query", ""))
+            elif fn_name == "check_inventory":
+                from app.inventory import get_inventory_status
+                result = get_inventory_status()
             elif fn_name == "check_order_status":
                 from app.sheets import get_orders_by_phone
                 orders = get_orders_by_phone(fn_args.get("phone", ""))
