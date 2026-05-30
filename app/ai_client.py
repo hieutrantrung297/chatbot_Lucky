@@ -1,9 +1,13 @@
-"""AI client dùng GitHub Models API (OpenAI-compatible) với model gpt-4o-mini."""
+"""AI client dùng GitHub Models API (OpenAI-compatible) với model gpt-4o-mini.
+
+Fallback: nếu GitHub Models bị rate limit (429), tự động chuyển sang OpenAI
+thực sự nếu OPENAI_API_KEY có trong .env.
+"""
 
 import logging
 from pathlib import Path
 
-from openai import OpenAI
+from openai import OpenAI, RateLimitError
 
 from app.config import get_settings
 
@@ -20,12 +24,25 @@ def _load_system_prompt() -> str:
     return _system_prompt_template
 
 
-def _get_client() -> OpenAI:
+def _get_github_client() -> OpenAI:
     settings = get_settings()
     return OpenAI(
         base_url=settings.github_models_endpoint,
         api_key=settings.github_token,
     )
+
+
+def _get_openai_client() -> OpenAI | None:
+    """Trả về OpenAI client nếu OPENAI_API_KEY có, ngược lại None."""
+    settings = get_settings()
+    if settings.openai_api_key:
+        return OpenAI(api_key=settings.openai_api_key)
+    return None
+
+
+# giữ alias để order_agent.py không cần đổi
+def _get_client() -> OpenAI:
+    return _get_github_client()
 
 
 def build_system_message(catalog_text: str, current_state: str, order_in_progress: str) -> str:
@@ -67,6 +84,21 @@ def get_ai_response(
             temperature=0.7,
         )
         return response.choices[0].message.content.strip()
+    except RateLimitError:
+        logger.warning("GitHub Models rate limit — thử fallback OpenAI")
+        fallback = _get_openai_client()
+        if fallback:
+            try:
+                resp2 = fallback.chat.completions.create(
+                    model=settings.openai_model,
+                    messages=messages,
+                    max_tokens=500,
+                    temperature=0.7,
+                )
+                return resp2.choices[0].message.content.strip()
+            except Exception as exc2:
+                logger.error("Lỗi OpenAI fallback: %s", exc2)
+        return "Dạ xin lỗi anh/chị, em đang gặp sự cố kỹ thuật. Anh/chị vui lòng thử lại sau ít phút nhé! 🙏"
     except Exception as exc:
         logger.error("Lỗi gọi AI API: %s", exc)
         return "Dạ xin lỗi anh/chị, em đang gặp sự cố kỹ thuật. Anh/chị vui lòng thử lại sau ít phút nhé! 🙏"

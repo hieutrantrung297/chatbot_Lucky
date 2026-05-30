@@ -47,6 +47,38 @@ def _get_worksheet():
     return worksheet
 
 
+def get_orders_by_phone(phone: str) -> list[dict]:
+    """Tra cứu tất cả đơn hàng theo số điện thoại. Trả về list dict hoặc [] nếu lỗi."""
+    import re
+    phone_clean = re.sub(r"[\s\-.()+]", "", phone)
+    if phone_clean.startswith("84"):
+        phone_clean = "0" + phone_clean[2:]
+    try:
+        worksheet = _get_worksheet()
+        records = worksheet.get_all_records()
+        matched = []
+        for row in records:
+            row_phone = re.sub(r"[\s\-.()+]", "", str(row.get("SĐT", "")))
+            if row_phone == phone_clean:
+                matched.append({
+                    "order_id":     row.get("Mã Đơn", ""),
+                    "created_at":   row.get("Thời Gian", ""),
+                    "name":         row.get("Tên KH", ""),
+                    "phone":        row.get("SĐT", ""),
+                    "cake_type":    row.get("Loại Bánh", ""),
+                    "size":         row.get("Size", ""),
+                    "flavor":       row.get("Hương Vị", ""),
+                    "delivery_date": row.get("Ngày Giao", ""),
+                    "address":      row.get("Địa Chỉ", ""),
+                    "total_price":  row.get("Tổng Tiền", ""),
+                    "status":       row.get("Trạng Thái", ""),
+                })
+        return matched
+    except Exception as exc:
+        logger.error("Lỗi tra cứu đơn theo SĐT: %s", exc)
+        return []
+
+
 def append_order(order: Order) -> bool:
     """Ghi 1 đơn hàng mới vào Google Sheets. Trả về True nếu thành công."""
     print(f"[SHEETS] Đang ghi đơn {order.order_id} vào Google Sheets...")

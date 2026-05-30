@@ -2,13 +2,24 @@
 
 import logging
 import re
+import unicodedata
 import uuid
 from datetime import datetime, timedelta
+from typing import Optional
 
 from app.catalog import calculate_delivery_fee, get_min_order_days, get_price
-from app.models import ConversationRecord, ConversationState, Order, OrderStatus
+from app.models import ConversationRecord, ConversationState, Order, OrderInProgress, OrderStatus
 
 logger = logging.getLogger(__name__)
+
+
+def _no_diacritics(text: str) -> str:
+    """Chuyển tiếng Việt về không dấu để nhận diện input dù khách nhắn có/không dấu."""
+    text = text.replace("đ", "d").replace("Đ", "D")
+    return "".join(
+        c for c in unicodedata.normalize("NFKD", text)
+        if not unicodedata.combining(c)
+    )
 
 # ── Câu hỏi cho từng field ──────────────────────────────────────────────────
 
@@ -77,6 +88,31 @@ def _generate_order_id() -> str:
     return f"LUCKY-{today}-{short_id}"
 
 
+def _fmt_vnd(amount: float) -> str:
+    """Định dạng số tiền theo chuẩn Việt Nam: 320.000đ."""
+    return f"{amount:,.0f}đ".replace(",", ".")
+
+
+def format_order_summary(order: OrderInProgress, is_cream_cake: bool, unit_price: float) -> str:
+    """Tạo tin nhắn tóm tắt đơn để hỏi xác nhận."""
+    cake_msg_line = f"📝 Chữ trên bánh: {order.cake_message}\n" if (is_cream_cake and order.cake_message) else ""
+    deposit = unit_price * 0.5
+    return (
+        f"📋 Em xin xác nhận lại đơn của anh/chị:\n\n"
+        f"👤 Tên: {order.name}\n"
+        f"📱 SĐT: {order.phone}\n"
+        f"🎂 Bánh: {order.cake_type} ({order.size})\n"
+        f"🍫 Hương vị: {order.flavor}\n"
+        f"{cake_msg_line}"
+        f"📅 Ngày giao: {order.delivery_date}\n"
+        f"📍 Địa chỉ: {order.address}\n\n"
+        f"💰 Tổng tiền: {_fmt_vnd(unit_price)}\n"
+        f"💳 Tiền cọc (50%): {_fmt_vnd(deposit)}\n\n"
+        f"Thông tin trên có đúng không ạ? ✅\n"
+        f"(Nhắn *'xác nhận'* để chốt đơn, hoặc *'sửa tên/sđt/bánh/size/hương vị/chữ/ngày/địa chỉ'* để chỉnh)"
+    )
+
+
 def _format_order_confirmation(order: Order) -> str:
     """Tạo tin nhắn xác nhận đơn hàng đẹp."""
     cake_msg_line = f"📝 Chữ trên bánh: {order.cake_message}\n" if order.cake_message else ""
@@ -93,10 +129,8 @@ def _format_order_confirmation(order: Order) -> str:
         f"📅 Ngày giao: {order.delivery_date}\n"
         f"📍 Địa chỉ: {order.address}\n"
         f"{special_line}\n"
-        f"💰 Tổng tiền: {order.total_price:,.0f}đ\n"
-        f"💳 Tiền cọc (50%): {order.deposit_required:,.0f}đ\n\n"
-        f"Anh/chị vui lòng chuyển khoản tiền cọc để xác nhận đơn nhé! "
-        f"Em sẽ liên hệ lại để xác nhận chi tiết. Cảm ơn anh/chị! 🎉"
+        f"💰 Tổng tiền tham khảo: {_fmt_vnd(order.total_price)}\n\n"
+        f"Bên em sẽ liên hệ lại với anh/chị để xác nhận chi tiết đơn hàng. Cảm ơn anh/chị! 🎉"
     )
 
 
@@ -171,42 +205,136 @@ def process_ordering(record: ConversationRecord, user_text: str) -> tuple[Conver
         reply = FIELD_QUESTIONS.get(next_field, f"Anh/chị cho em biết {next_field} nhé ạ?")
         return record, reply
 
-    # ── Đủ thông tin → tạo đơn hàng ─────────────────────────────────────────
+    # ── Đủ thông tin → chuyển sang bước xác nhận ────────────────────────────
     unit_price = get_price(order.cake_type or "", order.size or "")
-    delivery_fee = 0.0  # Tính thêm nếu có tích hợp tính khoảng cách
-    total = unit_price + delivery_fee
-    deposit = total * 0.5
-
-    completed_order = Order(
-        order_id=_generate_order_id(),
-        psid=record.psid,
-        name=order.name or "",
-        phone=order.phone or "",
-        cake_type=order.cake_type or "",
-        size=order.size or "",
-        flavor=order.flavor or "",
-        cake_message=order.cake_message if order.cake_message else None,
-        delivery_date=order.delivery_date or "",
-        address=order.address or "",
-        special_requests=order.special_requests,
-        unit_price=unit_price,
-        delivery_fee=delivery_fee,
-        total_price=total,
-        deposit_required=deposit,
-        status=OrderStatus.PENDING,
-        created_at=datetime.now().strftime("%d/%m/%Y %H:%M"),
-    )
-
-    # Ghi vào Google Sheets (import late để tránh circular)
-    from app.sheets import append_order
-    append_order(completed_order)
-
-    record.state = ConversationState.CONFIRMED
-    record.current_order_id = completed_order.order_id
-    record.order_in_progress = type(order)()  # reset
-
-    reply = _format_order_confirmation(completed_order)
+    record.state = ConversationState.CONFIRMING
+    reply = format_order_summary(order, record.is_cream_cake, unit_price)
     return record, reply
+
+
+# Map từ khóa sửa → tên field
+# Thứ tự quan trọng: specific keywords trước, broad keywords sau.
+# "bánh" rất broad nên cake_type phải đứng SAU size và cake_message.
+_EDIT_KEYWORDS: list[tuple[list[str], str]] = [
+    (["tên", "họ tên", "họ và tên"], "name"),
+    (["sđt", "số điện thoại", "điện thoại", "phone"], "phone"),
+    (["size", "kích cỡ", "cỡ", "cm"], "size"),
+    (["hương vị", "vị", "flavor"], "flavor"),
+    (["chữ", "nội dung", "ghi trên bánh", "cake message"], "cake_message"),
+    (["loại bánh", "loại", "bánh"], "cake_type"),
+    (["ngày", "ngày giao", "giao hàng", "ngày nhận"], "delivery_date"),
+    (["địa chỉ", "địa chi", "giao tới", "giao đến"], "address"),
+]
+
+
+def _detect_edit_field(text: str) -> Optional[str]:
+    """Phát hiện khách muốn sửa field nào — hỗ trợ cả có/không dấu."""
+    lower = text.lower()
+    lower_nd = _no_diacritics(lower)
+    for keywords, field in _EDIT_KEYWORDS:
+        for kw in keywords:
+            if kw in lower or _no_diacritics(kw) in lower_nd:
+                return field
+    return None
+
+
+def process_confirming(record: ConversationRecord, user_text: str) -> tuple[ConversationRecord, str]:
+    """
+    Xử lý tin nhắn khi đang ở bước xác nhận đơn (state CONFIRMING).
+    - 'xác nhận / ok / đúng / oke' → chốt đơn
+    - 'sửa tên/sđt/...' → quay về ORDERING, reset field đó
+    - 'hủy' → hủy đơn
+    Hỗ trợ cả input có dấu lẫn không dấu (xac nhan / sua ngay...).
+    """
+    lower = user_text.lower()
+    lower_nd = _no_diacritics(lower)
+    order = record.order_in_progress
+
+    def _match(keywords: list[str]) -> bool:
+        for kw in keywords:
+            if kw in lower or _no_diacritics(kw) in lower_nd:
+                return True
+        return False
+
+    # ── Hủy đơn ─────────────────────────────────────────────────────────────
+    cancel_keywords = ["hủy", "thôi", "không đặt", "bỏ qua", "cancel"]
+    if _match(cancel_keywords):
+        record.state = ConversationState.CANCELLED
+        record.order_in_progress = OrderInProgress()
+        return record, "Dạ em đã hủy đơn hàng cho anh/chị rồi ạ. Nếu cần hỗ trợ gì thêm hãy nhắn em nhé! 😊"
+
+    # ── Xác nhận chốt đơn ───────────────────────────────────────────────────
+    confirm_keywords = ["xác nhận", "ok", "oke", "đúng", "đúng rồi", "chốt", "yes", "đồng ý", "chính xác"]
+    if _match(confirm_keywords):
+        unit_price = get_price(order.cake_type or "", order.size or "")
+        delivery_fee = 0.0
+        total = unit_price + delivery_fee
+        deposit = total * 0.5
+
+        completed_order = Order(
+            order_id=_generate_order_id(),
+            psid=record.psid,
+            name=order.name or "",
+            phone=order.phone or "",
+            cake_type=order.cake_type or "",
+            size=order.size or "",
+            flavor=order.flavor or "",
+            cake_message=order.cake_message if order.cake_message else None,
+            delivery_date=order.delivery_date or "",
+            address=order.address or "",
+            special_requests=order.special_requests,
+            unit_price=unit_price,
+            delivery_fee=delivery_fee,
+            total_price=total,
+            deposit_required=deposit,
+            status=OrderStatus.PENDING,
+            created_at=datetime.now().strftime("%d/%m/%Y %H:%M"),
+        )
+
+        from app.sheets import append_order
+        append_order(completed_order)
+
+        record.state = ConversationState.CONFIRMED
+        record.current_order_id = completed_order.order_id
+        record.order_in_progress = OrderInProgress()
+
+        # Inject dòng phân cách để AI không tiếp tục context đơn cũ ở lần sau
+        record.message_history.append({
+            "role": "assistant",
+            "content": "[ĐƠN HÀNG ĐÃ HOÀN TẤT. Các tin nhắn tiếp theo là hội thoại mới, không liên quan đến đơn trên.]"
+        })
+
+        return record, _format_order_confirmation(completed_order)
+
+    # ── Sửa field cụ thể ────────────────────────────────────────────────────
+    _FIELD_LABELS_VI = {
+        "name": "tên người nhận",
+        "phone": "số điện thoại",
+        "cake_type": "loại bánh",
+        "size": "size bánh",
+        "flavor": "hương vị",
+        "cake_message": "chữ ghi trên bánh",
+        "delivery_date": "ngày giao",
+        "address": "địa chỉ",
+    }
+    edit_field = _detect_edit_field(lower)
+    if edit_field is None:
+        edit_field = _detect_edit_field(lower_nd)
+    if edit_field:
+        # Reset field đó về None, quay về ORDERING để hỏi lại
+        setattr(order, edit_field, None)
+        if edit_field == "cake_type":
+            record.is_cream_cake = False
+        record.order_in_progress = order
+        record.state = ConversationState.ORDERING
+        field_label = _FIELD_LABELS_VI.get(edit_field, edit_field)
+        question = FIELD_QUESTIONS.get(edit_field, f"Anh/chị cho em biết {field_label} mới nhé ạ?")
+        return record, f"Dạ, anh/chị cho em biết lại {field_label} nhé ạ!\n\n{question}"
+
+    # ── Không rõ ý → nhắc lại ───────────────────────────────────────────────
+    unit_price = get_price(order.cake_type or "", order.size or "")
+    summary = format_order_summary(order, record.is_cream_cake, unit_price)
+    return record, f"Dạ anh/chị vui lòng xác nhận hoặc cho em biết cần sửa gì ạ!\n\n{summary}"
 
 
 def get_first_question() -> str:

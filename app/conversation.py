@@ -3,14 +3,16 @@
 import asyncio
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
-from app.ai_client import get_ai_response
-from app.catalog import get_catalog_text
+from app.agent import get_agent_response
 from app.config import get_settings
 from app.models import ConversationRecord, ConversationState, OrderInProgress
-from app.order_handler import get_first_question, process_ordering
+from app.order_agent import process_order_turn
+from app.order_handler import get_first_question, process_confirming
+
+ORDERING_TIMEOUT_HOURS = 5
 
 logger = logging.getLogger(__name__)
 
@@ -65,81 +67,64 @@ def _save_record(record: ConversationRecord) -> None:
     _save_all(all_data)
 
 
-# ── Keyword detection ────────────────────────────────────────────────────────
-
-_ORDER_KEYWORDS = [
-    "đặt bánh", "đặt hàng", "mua bánh", "order bánh",
-    "muốn mua", "cần bánh", "đặt cho mình", "đặt cho tôi",
-    "tôi muốn đặt", "mình muốn đặt", "cho mình đặt",
-]
-
-
-def _user_wants_to_order(text: str) -> bool:
-    lower = text.lower()
-    return any(kw in lower for kw in _ORDER_KEYWORDS)
-
-
 # ── Main handler ─────────────────────────────────────────────────────────────
 
 async def handle_message(psid: str, user_text: str) -> str:
-    """
-    Xử lý 1 tin nhắn từ user, trả về reply text.
-    Toàn bộ logic được bảo vệ bởi per-user lock.
-    """
+    """Xử lý 1 tin nhắn từ user, trả về reply text."""
     async with _get_lock(psid):
         record = _load_record(psid)
-        record.last_activity = datetime.now().strftime("%d/%m/%Y %H:%M")
 
-        # Thêm tin nhắn của user vào lịch sử
+        # ── Auto-reset sau timeout ────────────────────────────────────────────
+        _reset_states = (
+            ConversationState.ORDERING,
+            ConversationState.CONFIRMING,
+            ConversationState.CONFIRMED,
+        )
+        if record.state in _reset_states:
+            try:
+                last = datetime.strptime(record.last_activity, "%d/%m/%Y %H:%M")
+                if datetime.now() - last > timedelta(minutes=ORDERING_TIMEOUT_HOURS):
+                    record.state = ConversationState.BROWSING
+                    record.order_in_progress = OrderInProgress()
+                    record.is_cream_cake = False
+                    record.message_history = []
+                    logger.info("Auto-reset hội thoại %s sau timeout", psid)
+            except (ValueError, TypeError):
+                pass
+
+        record.last_activity = datetime.now().strftime("%d/%m/%Y %H:%M")
         record.message_history.append({"role": "user", "content": user_text})
 
-        # ── Trạng thái đang đặt hàng → order_handler xử lý ──────────────────
-        if record.state == ConversationState.ORDERING:
-            record, reply = process_ordering(record, user_text)
+        # ── CONFIRMING: xác nhận / sửa / hủy đơn ────────────────────────────
+        if record.state == ConversationState.CONFIRMING:
+            record, reply = process_confirming(record, user_text)
 
-        # ── Phát hiện ý định đặt hàng → chuyển sang ordering ─────────────────
-        elif _user_wants_to_order(user_text) and record.state not in (
-            ConversationState.CONFIRMED, ConversationState.ORDERING
-        ):
-            record.state = ConversationState.ORDERING
-            record.order_in_progress = OrderInProgress()
-            record.is_cream_cake = False
-            reply = get_first_question()
+        # ── ORDERING: agentic order agent ────────────────────────────────────
+        elif record.state == ConversationState.ORDERING:
+            record, reply = await process_order_turn(record, user_text)
 
-        # ── Hội thoại tự do → AI xử lý ───────────────────────────────────────
+        # ── Trạng thái còn lại: browsing agent (RAG + tools) ─────────────────
         else:
-            if record.state == ConversationState.GREETING:
+            if record.state in (ConversationState.GREETING, ConversationState.CONFIRMED):
                 record.state = ConversationState.BROWSING
 
-            catalog_text = get_catalog_text()
-            order_summary = (
-                record.order_in_progress.model_dump_json()
-                if record.state == ConversationState.ORDERING
-                else "Chưa có đơn hàng"
+            reply, wants_order = await get_agent_response(
+                message_history=record.message_history[:-1],
+                user_text=user_text,
             )
 
-            reply = get_ai_response(
-                message_history=record.message_history[:-1],  # Không tính tin vừa append
-                catalog_text=catalog_text,
-                current_state=record.state.value,
-                order_in_progress=order_summary,
-            )
-
-            # Nếu AI phát hiện khách muốn đặt hàng và đề nghị (dự phòng)
-            order_trigger_in_reply = any(
-                kw in reply.lower()
-                for kw in ["để em hỗ trợ", "bắt đầu đặt hàng", "cho em biết tên"]
-            )
-            if order_trigger_in_reply and record.state != ConversationState.ORDERING:
+            # Agent phát hiện khách muốn đặt hàng
+            if wants_order:
                 record.state = ConversationState.ORDERING
                 record.order_in_progress = OrderInProgress()
                 record.is_cream_cake = False
-                reply = reply + "\n\n" + get_first_question()
+                first_q = get_first_question()
+                reply = (reply + "\n\n" + first_q).strip() if reply else first_q
 
-        # Thêm phản hồi vào lịch sử
+        # Lưu reply vào lịch sử
         record.message_history.append({"role": "assistant", "content": reply})
 
-        # Giới hạn lịch sử tối đa 40 messages (20 turns)
+        # Giới hạn 40 messages
         if len(record.message_history) > 40:
             record.message_history = record.message_history[-40:]
 

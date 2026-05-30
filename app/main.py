@@ -17,6 +17,22 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="Lucky Cake Chatbot", version="1.0.0")
 
 
+@app.on_event("startup")
+async def startup_event():
+    """Build knowledge base index trong nền — không block server startup."""
+    import asyncio
+    from app.knowledge_base import build_index
+
+    async def _build():
+        try:
+            await asyncio.to_thread(build_index)
+            logger.info("Knowledge base index da san sang")
+        except Exception as exc:
+            logger.error("Loi build knowledge base: %s", exc)
+
+    asyncio.create_task(_build())
+
+
 @app.get("/")
 async def health_check():
     """Health check endpoint — dùng để kiểm tra server đang chạy."""
